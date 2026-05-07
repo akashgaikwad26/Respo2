@@ -7,7 +7,7 @@ __pycache__/
 .venv/
 venv/
 venv*/
-models/
+models/medgemma/
 .streamlit/
 .ipynb_checkpoints/
 *.log
