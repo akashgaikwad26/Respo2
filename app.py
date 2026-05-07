@@ -531,6 +531,57 @@ def get_audio_embedding(audio_tensor):
     return torch.from_numpy(embedding).squeeze()
 
 
+def split_into_hear_windows(waveform):
+    """Split audio into 2-second windows because HeAR expects fixed-length input."""
+    if waveform.numel() == 0:
+        return [torch.zeros(TARGET_LEN, dtype=torch.float32)]
+
+    windows = []
+    total_samples = waveform.numel()
+    for start in range(0, total_samples, TARGET_LEN):
+        chunk = waveform[start : start + TARGET_LEN]
+        # Pad the last chunk so every window still fits the model input size.
+        if chunk.numel() < TARGET_LEN:
+            chunk = torch.nn.functional.pad(chunk, (0, TARGET_LEN - chunk.numel()))
+        windows.append(chunk.float())
+    return windows
+
+
+def analyze_recording_windows(waveform, reference_embedding):
+    """
+    Score each 2-second window and keep the strongest valid cough window.
+
+    For longer recordings, this avoids ignoring coughs that happen after
+    the first 2 seconds.
+    """
+    windows = split_into_hear_windows(waveform)
+    window_results = []
+
+    for window in windows:
+        rms, peak, signal_factor, signal_quality, silence_ratio = analyze_signal(window)
+        embedding = get_audio_embedding(window)
+        risk = calculate_dynamic_risk(embedding, reference_embedding, signal_factor)
+        window_results.append(
+            {
+                "embedding": embedding,
+                "risk": risk,
+                "rms": rms,
+                "peak": peak,
+                "signal_factor": signal_factor,
+                "signal_quality": signal_quality,
+                "silence_ratio": silence_ratio,
+            }
+        )
+
+    # Prefer the window with the highest risk among windows that have some signal.
+    # If all windows are weak, fall back to the best risk overall.
+    strong_windows = [item for item in window_results if item["signal_factor"] > 0.15]
+    ranked_windows = strong_windows if strong_windows else window_results
+    best_window = max(ranked_windows, key=lambda item: item["risk"])
+    best_window["window_count"] = len(window_results)
+    return best_window
+
+
 def decode_audio_bytes(audio_bytes):
     """Decode uploaded or recorded audio into a mono waveform."""
     try:
@@ -542,10 +593,44 @@ def decode_audio_bytes(audio_bytes):
             waveform = waveform.mean(dim=1)
         return waveform, sample_rate
     except Exception:
-        waveform, sample_rate = torchaudio.load(io.BytesIO(audio_bytes))
-        if waveform.dim() > 1:
-            waveform = waveform.mean(dim=0)
-        return waveform.float(), sample_rate
+        try:
+            waveform, sample_rate = torchaudio.load(io.BytesIO(audio_bytes))
+            if waveform.dim() > 1:
+                waveform = waveform.mean(dim=0)
+            return waveform.float(), sample_rate
+        except Exception:
+            # Some browser recordings arrive as .webm/Opus, which is more
+            # reliably handled by ffmpeg than by Python audio libraries.
+            with tempfile.TemporaryDirectory() as temp_dir:
+                source_path = os.path.join(temp_dir, "upload.webm")
+                output_path = os.path.join(temp_dir, "upload.wav")
+                with open(source_path, "wb") as handle:
+                    handle.write(audio_bytes)
+
+                subprocess.run(
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-i",
+                        source_path,
+                        "-ar",
+                        str(TARGET_SR),
+                        "-ac",
+                        "1",
+                        output_path,
+                    ],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+
+                import soundfile as sf
+
+                data, sample_rate = sf.read(output_path)
+                waveform = torch.tensor(data).float()
+                if waveform.dim() > 1:
+                    waveform = waveform.mean(dim=1)
+                return waveform, sample_rate
 
 
 def analyze_signal(waveform):
@@ -795,7 +880,7 @@ def break_long_pdf_words(text, max_len=32):
     return re.sub(r"\S{" + str(max_len + 1) + r",}", split_word, text)
 
 
-def compose_report_text(report, band, score, signal_quality, duration_sec):
+def compose_report_text(report, band, score, signal_quality, duration_sec, window_count=None):
     lines = []
     lines.append("RespiGuard Diagnostic Report")
     lines.append(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -803,6 +888,8 @@ def compose_report_text(report, band, score, signal_quality, duration_sec):
     lines.append("Patient Intake")
     if duration_sec:
         lines.append(f"Sample duration: {duration_sec:.1f}s")
+    if window_count:
+        lines.append(f"Windows analyzed: {window_count}")
     lines.append(f"Signal quality: {signal_quality}")
     lines.append("")
     lines.append("Biomarker Analysis")
@@ -938,7 +1025,6 @@ st.markdown(
                 <div class="rg-subtitle">Offline Acoustic Triage | Powered by Google HeAR & MedGemma</div>
             </div>
         </div>
-        <div class="rg-badge">M4 Ready</div>
     </div>
     """,
     unsafe_allow_html=True,
@@ -968,7 +1054,7 @@ with col_input:
     else:
         audio_source = st.file_uploader(
             "Upload cough sample",
-            type=["wav", "mp3", "m4a", "flac", "ogg", "aiff", "aif"],
+            type=["wav", "mp3", "m4a", "flac", "ogg", "aiff", "aif", "webm"],
         )
         if audio_source is not None:
             st.audio(audio_source)
@@ -1032,14 +1118,21 @@ if audio_source and run_clicked:
             resampler = torchaudio.transforms.Resample(sample_rate, TARGET_SR)
             waveform = resampler(waveform)
 
-        rms, peak, signal_factor, signal_quality, silence_ratio = analyze_signal(waveform)
-        user_vector = get_audio_embedding(waveform)
+        # Analyze the full recording in fixed 2-second windows, then keep
+        # the most informative cough segment instead of only the first chunk.
+        best_window = analyze_recording_windows(waveform, healthy_reference)
+        rms = best_window["rms"]
+        peak = best_window["peak"]
+        signal_factor = best_window["signal_factor"]
+        signal_quality = best_window["signal_quality"]
+        silence_ratio = best_window["silence_ratio"]
+        user_vector = best_window["embedding"]
         duration_sec = float(waveform.numel()) / float(TARGET_SR) if TARGET_SR else 0.0
 
         if DEMO_MODE:
             score = 0.88
         else:
-            score = calculate_dynamic_risk(user_vector, healthy_reference, signal_factor)
+            score = best_window["risk"]
 
     st.session_state["risk"] = score
     st.session_state["vector"] = user_vector
@@ -1050,6 +1143,7 @@ if audio_source and run_clicked:
     st.session_state["signal_silence_ratio"] = silence_ratio
     st.session_state["audio_bytes"] = audio_bytes
     st.session_state["audio_duration"] = duration_sec
+    st.session_state["window_count"] = best_window["window_count"]
     st.session_state["report"] = None
     st.session_state["report_risk"] = score
     st.session_state["tts_audio"] = None
@@ -1084,8 +1178,9 @@ if "risk" in st.session_state:
     )
 
     inference_time = st.session_state.get("report_time", 0.0)
+    window_count = st.session_state.get("window_count", 1)
     st.markdown(
-        f"<div class='rg-meta'>Report generated in {inference_time:.2f}s</div>",
+        f"<div class='rg-meta'>Report generated in {inference_time:.2f}s | Analyzed {window_count} window(s)</div>",
         unsafe_allow_html=True,
     )
     duration_sec = st.session_state.get("audio_duration", 0.0)
@@ -1095,6 +1190,7 @@ if "risk" in st.session_state:
         st.session_state["risk"],
         signal_quality,
         duration_sec,
+        window_count,
     )
     pdf_bytes = generate_pdf_bytes(report_text)
     report_stamp = time.strftime("%Y%m%d_%H%M%S")
